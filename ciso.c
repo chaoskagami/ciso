@@ -15,7 +15,6 @@
     along with Foobar; if not, write to the Free Software
     Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
-
     Copyright 2005 BOOSTER
 */
 
@@ -25,6 +24,8 @@
 #include <string.h>
 #include <zlib.h>               /* /usr(/local)/include/zlib.h */
 #include <zconf.h>
+
+#include <zopfli.h>
 
 #include "ciso.h"
 
@@ -163,7 +164,7 @@ int decomp_ciso(void)
 
 		if (inflateInit2(&z,-15) != Z_OK)
 		{
-			printf("deflateInit : %s\n", (z.msg) ? z.msg : "???");
+			printf("inflateInit : %s\n", (z.msg) ? z.msg : "???");
 			return 1;
 		}
 
@@ -249,6 +250,8 @@ int comp_ciso(int level)
 	int percent_period;
 	int percent_cnt;
 	int align,align_b,align_m;
+    unsigned char ptr;
+    ZopfliOptions opts;
 
 	file_size = check_file_size(fin);
 	if(file_size==(uint64_t)-1LL)
@@ -273,17 +276,24 @@ int comp_ciso(int level)
 	memset(crc_buf,0,index_size);
 	memset(buf4,0,sizeof(buf4));
 
+    ZopfliInitOptions(&opts);
+//    opts.verbose = 1;
+//    opts.verbose_more = 1;
+    opts.numiterations = level;
+    opts.blocksplitting = 0; // Nope.
+
 	/* init zlib */
 	z.zalloc = Z_NULL;
 	z.zfree  = Z_NULL;
 	z.opaque = Z_NULL;
 
 	/* show info */
-	printf("Compress '%s' to '%s'\n",fname_in,fname_out);
-	printf("Total File Size %lld bytes\n",ciso.total_bytes);
-	printf("block size      %d  bytes\n",ciso.block_size);
-	printf("index align     %d\n",1<<ciso.align);
-	printf("compress level  %d\n",level);
+	printf("Compressing '%s' to '%s'\n",fname_in,fname_out);
+	printf("Total File Size   %lld bytes\n",ciso.total_bytes);
+	printf("block size        %d  bytes\n",ciso.block_size);
+	printf("block count       %d  blocks\n",ciso_total_block);
+	printf("index align       %d\n",1<<ciso.align);
+	printf("iterations/block  %d\n",level);
 
 	/* write header block */
 	fwrite(&ciso,1,sizeof(ciso),fout);
@@ -293,27 +303,21 @@ int comp_ciso(int level)
 
 	write_pos = sizeof(ciso) + index_size;
 
-	/* compress data */
-	percent_period = ciso_total_block/100;
-	percent_cnt    = ciso_total_block/100;
-
 	align_b = 1<<(ciso.align);
 	align_m = align_b -1;
 
-	for(block = 0;block < ciso_total_block ; block++)
-	{
-		if(--percent_cnt<=0)
-		{
-			percent_cnt = percent_period;
-			printf("compress %3d%% avarage rate %3d%%\r"
-				,block / percent_period
-				,block==0 ? 0 : (uint32_t)(100*write_pos/(block*0x800)));
-		}
+	size_t out_data_siz;
+	size_t calc = ciso_total_block / 100;
+	if (calc == 0)
+		calc = 1;
 
-		if (deflateInit2(&z, level , Z_DEFLATED, -15,8,Z_DEFAULT_STRATEGY) != Z_OK)
-		{
-			printf("deflateInit : %s\n", (z.msg) ? z.msg : "???");
-			return 1;
+	for(block = 0; block < ciso_total_block; block++)
+	{
+		if (block % calc == 0 && block != 0) {
+			printf("%d%% processed: percent of original is %d%%\r",
+				(block + 1) * 100  / ciso_total_block,
+				100 * write_pos / ((block + 1) * ciso.block_size));
+			fflush(stdout);
 		}
 
 		/* write align */
@@ -333,53 +337,43 @@ int comp_ciso(int level)
 		index_buf[block] = write_pos>>(ciso.align);
 
 		/* read buffer */
-		z.next_out  = block_buf2;
-		z.avail_out = ciso.block_size*2;
-		z.next_in   = block_buf1;
-		z.avail_in  = fread(block_buf1, 1, ciso.block_size , fin);
-		if(z.avail_in != ciso.block_size)
+		unsigned char* next_out = 0;
+		size_t avail_out        = 0; // Unlike zlib, this is filled in.
+		unsigned char* next_in  = block_buf1;
+		size_t avail_in         = fread(block_buf1, 1, ciso.block_size, fin);
+		if(avail_in != ciso.block_size)
 		{
 			printf("block=%d : read error\n",block);
 			return 1;
 		}
 
-		/* compress block
-		status = deflate(&z, Z_FULL_FLUSH);*/
-		status = deflate(&z, Z_FINISH);
-		if (status != Z_STREAM_END)
-	/*	if (status != Z_OK) */
-		{
-			printf("block %d:deflate : %s[%d]\n", block,(z.msg) ? z.msg : "error",status);
-			return 1;
-		}
+        // Deflate with zopfli
+        ptr = 0;
+        ZopfliDeflatePart(&opts, 2, 1, next_in, 0, avail_in, &ptr, &next_out, &avail_out);
 
-		cmp_size = ciso.block_size*2 - z.avail_out;
+		cmp_size = avail_out;
 
 		/* choise plain / compress */
 		if(cmp_size >= ciso.block_size)
 		{
 			cmp_size = ciso.block_size;
-			memcpy(block_buf2,block_buf1,cmp_size);
+			next_out = block_buf1;
 			/* plain block mark */
 			index_buf[block] |= 0x80000000;
 		}
 
 		/* write compressed block */
-		if(fwrite(block_buf2, 1,cmp_size , fout) != cmp_size)
+		if(fwrite(next_out, 1, cmp_size, fout) != cmp_size)
 		{
-			printf("block %d : Write error\n",block);
+			printf("block %d : Write error\n", block);
 			return 1;
 		}
+
+        if (next_out != block_buf1)
+			free(next_out);
 
 		/* mark next index */
 		write_pos += cmp_size;
-
-		/* term zlib */
-		if (deflateEnd(&z) != Z_OK)
-		{
-			printf("deflateEnd : %s\n", (z.msg) ? z.msg : "error");
-			return 1;
-		}
 	}
 
 	/* last position (total size)*/
@@ -403,16 +397,17 @@ int main(int argc, char *argv[])
 	int result;
 
 	fprintf(stderr, "Compressed ISO9660 converter Ver.1.02 by BOOSTER\n");
+	fprintf(stderr, " + Now with zopfli compressor support\n");
 
 	if (argc != 4)
 	{
 		printf("Usage: ciso level infile outfile\n");
-		printf("  level: 1-9 compress ISO to CSO (1=fast/large - 9=small/slow\n");
-		printf("         0   decompress CSO to ISO\n");
+		printf("  iter:  {1-N}   compress ISO to CSO (with N iterations per block)\n");
+		printf("         0       decompress CSO to ISO\n");
 		return 0;
 	}
-	level = argv[1][0] - '0';
-	if(level < 0 || level > 9)
+    sscanf(argv[1], "%d", &level);
+	if(level < 0)
 	{
         printf("Unknown mode: %c\n", argv[1][0]);
 		return 1;
